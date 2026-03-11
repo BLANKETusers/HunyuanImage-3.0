@@ -27,7 +27,9 @@ from PIL import Image
 from einops import rearrange
 from torch import Tensor
 from torch import nn
-from torch.cuda import nvtx
+# from torch.cuda import nvtx
+import torch_npu
+from torch_npu.contrib import transfer_to_npu
 
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, StaticCache
@@ -929,10 +931,24 @@ class HunyuanStaticCache(StaticCache):
             A tuple containing the updated key and value states.
         """
         cache_position = cache_kwargs.get("cache_position")
-        if self.layers[layer_idx].keys is None:
-            self.layers[layer_idx].lazy_initialization(key_states)
-        k_out = self.layers[layer_idx].keys
-        v_out = self.layers[layer_idx].values
+        # if self.layers[layer_idx].keys is None:
+        #     self.layers[layer_idx].lazy_initialization(key_states)
+        # k_out = self.layers[layer_idx].keys
+        # v_out = self.layers[layer_idx].values
+
+        if hasattr(self, "key_cache") and hasattr(self, "value_cache"):
+            if self.key_cache[layer_idx].device != key_states.device:
+                self.key_cache[layer_idx] = self.key_cache[layer_idx].to(key_states.device)
+                self.value_cache[layer_idx] = self.value_cache[layer_idx].to(value_states.device)
+            k_out = self.key_cache[layer_idx]
+            v_out = self.value_cache[layer_idx]
+            key_states = key_states.to(k_out.dtype)
+            value_states = value_states.to(v_out.dtype)
+        else:
+            if self.layers[layer_idx].keys is None:
+                self.layers[layer_idx].lazy_initialization(key_states)
+            k_out = self.layers[layer_idx].keys
+            v_out = self.layers[layer_idx].values
 
         if cache_position is None:
             k_out.copy_(key_states)
@@ -1179,50 +1195,50 @@ class HunyuanMoE(nn.Module):
 
         reshaped_input = hidden_states.reshape(-1, hidden_size) # [bsz*seq_len, hidden_size]
 
-        with nvtx.range("MoE"):
-            if self._moe_impl == "flashinfer":
-                # Get expert weights
-                if not self._weights_initialized:
-                    self._initialize_weights_on_device(hidden_states.device)
-                topk_weight, topk_index = self.gate(hidden_states, topk_impl='easy')
+        # with nvtx.range("MoE"):
+        if self._moe_impl == "flashinfer":
+            # Get expert weights
+            if not self._weights_initialized:
+                self._initialize_weights_on_device(hidden_states.device)
+            topk_weight, topk_index = self.gate(hidden_states, topk_impl='easy')
 
-                combined_output = torch.zeros_like(reshaped_input)
-                _ = flashinfer.fused_moe.cutlass_fused_moe(     # noqa
-                    reshaped_input.contiguous(),
-                    topk_index.to(torch.int).contiguous(),
-                    topk_weight.to(torch.float).contiguous(),
-                    self.moe_weight,
-                    self.moe_weight_2,
-                    torch.bfloat16,
-                    output=combined_output,
-                    quant_scales=None,
-                )
-                combined_output = combined_output.reshape(bsz, seq_len, hidden_size)
-            else:
-                # DeepSeekMoE implementation
-                # Reference: https://huggingface.co/deepseek-ai/deepseek-moe-16b-chat/blob/main/modeling_deepseek.py#L375
-                with torch.autocast('cuda', enabled=False):
-                    topk_weights, topk_idx = self.gate(hidden_states, topk_impl='easy')
-                # Cast back to the input dtype
-                topk_weights = topk_weights.to(hidden_states.dtype)
+            combined_output = torch.zeros_like(reshaped_input)
+            _ = flashinfer.fused_moe.cutlass_fused_moe(     # noqa
+                reshaped_input.contiguous(),
+                topk_index.to(torch.int).contiguous(),
+                topk_weight.to(torch.float).contiguous(),
+                self.moe_weight,
+                self.moe_weight_2,
+                torch.bfloat16,
+                output=combined_output,
+                quant_scales=None,
+            )
+            combined_output = combined_output.reshape(bsz, seq_len, hidden_size)
+        else:
+            # DeepSeekMoE implementation
+            # Reference: https://huggingface.co/deepseek-ai/deepseek-moe-16b-chat/blob/main/modeling_deepseek.py#L375
+            with torch.autocast('cuda', enabled=False):
+                topk_weights, topk_idx = self.gate(hidden_states, topk_impl='easy')
+            # Cast back to the input dtype
+            topk_weights = topk_weights.to(hidden_states.dtype)
 
-                # Flatten for easier indexing
-                flat_topk_idx = topk_idx.view(-1)
-                hidden_states_flat = input_hidden_states.view(-1, hidden_size)    # (bsz * seq_len, hidden_size)
-                hidden_states_repeated = hidden_states_flat.repeat_interleave(self.moe_topk, dim=0)  # (bsz * seq_len * k, hidden_size)
+            # Flatten for easier indexing
+            flat_topk_idx = topk_idx.view(-1)
+            hidden_states_flat = input_hidden_states.view(-1, hidden_size)    # (bsz * seq_len, hidden_size)
+            hidden_states_repeated = hidden_states_flat.repeat_interleave(self.moe_topk, dim=0)  # (bsz * seq_len * k, hidden_size)
 
-                # Forward through experts
-                expert_outputs = torch.zeros_like(hidden_states_repeated, dtype=hidden_states_repeated.dtype, device=hidden_states_repeated.device)
-                for i in range(self.num_experts):
-                    expert_mask = (flat_topk_idx == i)
-                    selected_inputs = hidden_states_repeated[expert_mask]
-                    expert_output = self.experts[i](selected_inputs)    # compatible with zero tensor
-                    expert_outputs[expert_mask] = expert_output
+            # Forward through experts
+            expert_outputs = torch.zeros_like(hidden_states_repeated, dtype=hidden_states_repeated.dtype, device=hidden_states_repeated.device)
+            for i in range(self.num_experts):
+                expert_mask = (flat_topk_idx == i)
+                selected_inputs = hidden_states_repeated[expert_mask]
+                expert_output = self.experts[i](selected_inputs)    # compatible with zero tensor
+                expert_outputs[expert_mask] = expert_output
 
-                # Weighted sum of expert outputs
-                combined_output = (expert_outputs.view(
-                    bsz * seq_len, self.moe_topk, hidden_size) * topk_weights.unsqueeze(-1)).sum(dim=1)  # (bsz * seq_len, hidden_size)
-                combined_output = combined_output.to(hidden_states.dtype).view(bsz, seq_len, hidden_size)
+            # Weighted sum of expert outputs
+            combined_output = (expert_outputs.view(
+                bsz * seq_len, self.moe_topk, hidden_size) * topk_weights.unsqueeze(-1)).sum(dim=1)  # (bsz * seq_len, hidden_size)
+            combined_output = combined_output.to(hidden_states.dtype).view(bsz, seq_len, hidden_size)
 
         if self.config.use_mixed_mlp_moe:
             output = hidden_states_mlp + combined_output    # noqa

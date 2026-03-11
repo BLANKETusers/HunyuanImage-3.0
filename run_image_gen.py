@@ -13,11 +13,10 @@
 
 import argparse
 import os
+import torch
 from pathlib import Path
 from hunyuan_image_3 import HunyuanImage3ForCausalMM
 from PIL import Image
-from PE.deepseek import DeepSeekClient
-from PE.system_prompt import system_prompt_universal, system_prompt_text_rendering
 
 def parse_args():
     parser = argparse.ArgumentParser("Commandline arguments for running HunyuanImage-3 locally")
@@ -159,7 +158,8 @@ def main(args):
 
     kwargs = dict(
         attn_implementation=args.attn_impl,
-        torch_dtype="auto",
+        torch_dtype=torch.bfloat16,
+        trust_remote_code=True,
         device_map="auto",
         moe_impl=args.moe_impl,
         moe_drop_tokens=True,
@@ -182,6 +182,8 @@ def main(args):
     
     # Rewrite prompt with DeepSeek When use HunyuanImage-3.0
     if args.rewrite:
+        from PE.deepseek import DeepSeekClient
+        from PE.system_prompt import system_prompt_universal, system_prompt_text_rendering
         # Get request key_id and key_secret for DeepSeek
         deepseek_key_id = os.getenv("DEEPSEEK_KEY_ID")
         deepseek_key_secret = os.getenv("DEEPSEEK_KEY_SECRET")

@@ -499,7 +499,7 @@ class AutoencoderKLConv3D(ModelMixin, ConfigMixin):
 
         self.use_compile = False
 
-        self.empty_cache = torch.empty(0, device="cuda")
+        self.empty_cache = torch.empty(0, device="npu")
 
     def _set_gradient_checkpointing(self, module, value=False):
         if isinstance(module, (Encoder, Decoder)):
